@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  cloudfront-private-apigw
+
+  Sample SAM Template for cloudfront-private-apigw
+Parameters:
+  VPCId:
+    Description: Please provide a VPC to deploy the solution into.
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private Subnets for the ALB and VPC Endpoint
+  Route53HostedZoneId:
+    Type: String
+    Description: ID of your Route53 hosted zone acting as the authoritative DNS for your application domain name
+  CloudFrontCertificateARN:
+    Type: String
+    Description: ARN of the ACM Certificate that must be in the us-east-1 region
+  ALBCertificateARN:
+    Type: String
+    Description: ARN of the ACM Certificate in the same region as ALB
+  CloudFrontDomainName:
+    Type: String
+    Description: CloudFront Domain namae covered by the ACM certificate.
+
+Resources:
+  ########### API Gateway REST API ###############
+  MyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      EndpointConfiguration: PRIVATE
+      StageName: Prod
+      AlwaysDeploy: true
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: !Sub PrivateApi-${AWS::StackName}
+          version: "1.0"
+        servers:
+        - x-amazon-apigateway-endpoint-configuration:
+            vpcEndpointIds:
+            - !Ref ExecuteApiVpcEndpoint
+        paths:
+          /:
+            get:
+              responses:
+                "200":
+                  description: "200 response"
+                  content:
+                    application/json:
+                      schema:
+                        $ref: "#/components/schemas/Empty"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: "{\"message\": \"Hello from API GW\"}"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+        x-amazon-apigateway-policy:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "execute-api:/*"
+            Condition:
+              StringEquals:
+                aws:sourceVpce: 
+                - !Ref ExecuteApiVpcEndpoint
+      Domain:
+        DomainName: !Ref CloudFrontDomainName
+        CertificateArn : !Ref ALBCertificateARN
+  
+  ########### execute-api VPC Endpoint ###########
+  ExecuteApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
+      VpcId: !Ref VPCId
+      SubnetIds: !Ref PrivateSubnets
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointSG 
+
+  ########### Security Group for Amazon API Gateway VPC Endpoint ###########
+  VpcEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow https to VPC endpoint from internal ALB
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ########### Application Load Balancer (ALB) ###########
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal 
+      Subnets: !Ref PrivateSubnets      
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: true
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: true
+  
+  ########### ALB Target Group ###########
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 443
+      Name: !Sub TargetGroup-${AWS::StackName}
+      Protocol: HTTPS
+      VpcId: !Ref VPCId
+      Targets:
+        - Id: !GetAtt GetPrivateIPs.IP0
+          Port: 443
+        - Id: !GetAtt GetPrivateIPs.IP1
+          Port: 443
+      TargetType: ip
+      Matcher:
+        HttpCode: '200,403'
+    
+  ########### ALB Listener ###########  
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: '443'
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS-1-2-2017-01
+      Certificates:
+        - CertificateArn: !Ref ALBCertificateARN
+  
+  ########### Security Group for ALB ###########
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow https to ALB from CloudFront VPC Origin
+      VpcId: !Ref VPCId
+  
+  ########### Outbound rule for ALB Security Group ###########
+  ALBSecurityGroupOutboundRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      GroupId: !GetAtt ALBSecurityGroup.GroupId
+      DestinationSecurityGroupId: !GetAtt VpcEndpointSG.GroupId
+      
+    
+  ########### Cloudfront Distribution ###############
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        HttpVersion: http2and3
+        Comment: CloudFront Distribution with VPC Origin Integration
+        Aliases: 
+        - !Ref CloudFrontDomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CloudFrontCertificateARN
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+        Origins:
+        - Id: AlbOrigin
+          DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+          VpcOriginConfig:
+            OriginKeepaliveTimeout: 60
+            OriginReadTimeout: 60
+            VpcOriginId: !GetAtt CloudFrontVpcOrigin.Id
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: AlbOrigin
+          CachePolicyId: 83da9c7e-98b4-4e11-a168-04f0df8e2c65
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          ViewerProtocolPolicy: https-only
+  
+  ########### Cloudfront VPC Origin ###############
+  CloudFrontVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+          Arn: !Ref ApplicationLoadBalancer
+          Name: !Sub vpc-origin-${AWS::StackName}
+          OriginProtocolPolicy: https-only
+          OriginSSLProtocols: 
+          - TLSv1.2
+  
+  ########### Route53 Record Set ###############
+  R53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Ref CloudFrontDomainName
+      Type: A
+      HostedZoneId : !Ref Route53HostedZoneId
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        
+  ########### Custom Resource to Fetch Private IPs ###############
+  GetPrivateIPs:
+    DependsOn:
+      - ExecuteApiVpcEndpoint
+    Type: Custom::LambdaResource
+    Properties:
+      ServiceToken: !GetAtt FetchVPCEndpointIPsFunction.Arn
+      NetworkInterfaceIds: !GetAtt ExecuteApiVpcEndpoint.NetworkInterfaceIds
+  
+  ########### Custom Resource to Update Security Groups ###############
+  UpdateSecurityGroups:
+    DependsOn:
+      - CloudFrontVpcOrigin
+    Type: Custom::LambdaResource
+    Properties:
+      ServiceToken: !GetAtt FetchVPCEndpointIPsFunction.Arn
+      VpcId: !Ref VPCId 
+      SecurityGroupId: !Ref ALBSecurityGroup
+  
+  ########### Lambda Function to Fetch VPC Endpoint IPs ###############
+  FetchVPCEndpointIPsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub Custom-Resource-Lambda-${AWS::StackName}
+      Runtime: python3.13
+      Timeout: 60
+      Architectures: 
+        - arm64
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Policies:
+        - AWSLambdaExecute
+        - Version: '2012-10-17' 
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DescribeSecurityGroups
+                - ec2:AuthorizeSecurityGroupIngress 
+                - ec2:DescribeManagedPrefixLists
+              Resource: "*"
+
+Outputs:
+  CFURL:
+    Description: URL for Cloudfront Distribution
+    Value: !Sub https://${CloudFrontDomainName}
+  CFDistributionId: 
+    Description: CloudFront Distribution ID
+    Value: !Ref CloudFrontDistribution
+  ALBName: 
+    Description: Application Load Balancer Name
+    Value: !GetAtt ApplicationLoadBalancer.LoadBalancerName
+  APIGwId: 
+    Description: Private Amazon API Gateway ID
+    Value: !Ref MyApi
+  
