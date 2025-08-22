@@ -4,7 +4,7 @@ This solution demonstrates how to securely expose a private Amazon API Gateway t
 
 ## Architecture Diagram
 
-![Architecture Diagram](./architecture.png)
+![Architecture Diagram](./docs/architecture.png)
 
 ## Overview
 
